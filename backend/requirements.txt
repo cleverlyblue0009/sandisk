@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+faiss-cpu
+sentence-transformers
+numpy
+python-dotenv
+watchdog
+PyMuPDF
+python-docx
+python-pptx
+groq
+pydantic
