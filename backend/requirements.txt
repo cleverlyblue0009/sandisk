@@ -3,6 +3,8 @@ uvicorn[standard]
 faiss-cpu
 sentence-transformers
 numpy
+scikit-learn
+psutil
 python-dotenv
 watchdog
 PyMuPDF
@@ -10,3 +12,7 @@ python-docx
 python-pptx
 groq
 pydantic
+faster-whisper
+pyttsx3
+python-multipart
+firebase-admin

@@ -2,16 +2,45 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
-DOCUMENT_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".json"}
-CODE_EXTENSIONS = {".py", ".js", ".java", ".cpp"}
-SPREADSHEET_EXTENSIONS = {".csv"}
-PRESENTATION_EXTENSIONS = {".pptx"}
+DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv", ".pptx", ".json"}
+CODE_EXTENSIONS = {".py", ".js", ".java"}
+SUPPORTED_TEXT_EXTENSIONS = DOCUMENT_EXTENSIONS | CODE_EXTENSIONS
 
-SUPPORTED_EXTENSIONS = (
-    DOCUMENT_EXTENSIONS | CODE_EXTENSIONS | SPREADSHEET_EXTENSIONS | PRESENTATION_EXTENSIONS
-)
+SKIPPED_BINARY_EXTENSIONS = {
+    ".exe",
+    ".dll",
+    ".iso",
+    ".zip",
+    ".rar",
+    ".mp4",
+    ".jpg",
+    ".png",
+}
+
+STOP_WORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "this",
+    "that",
+    "from",
+    "into",
+    "have",
+    "your",
+    "about",
+    "file",
+    "notes",
+    "assignment",
+    "project",
+    "study",
+    "course",
+}
 
 
 def normalize_windows_path(path: str | Path) -> str:
@@ -19,19 +48,29 @@ def normalize_windows_path(path: str | Path) -> str:
     return os.path.normcase(resolved)
 
 
-def is_supported_file(path: str | Path) -> bool:
-    return Path(path).suffix.lower() in SUPPORTED_EXTENSIONS
+def file_extension(path: str | Path) -> str:
+    return Path(path).suffix.lower()
 
 
-def categorize_file(path: str | Path) -> str:
-    extension = Path(path).suffix.lower()
+def is_supported_text_file(path: str | Path) -> bool:
+    return file_extension(path) in SUPPORTED_TEXT_EXTENSIONS
+
+
+def is_binary_metadata_only(path: str | Path) -> bool:
+    return file_extension(path) in SKIPPED_BINARY_EXTENSIONS
+
+
+def classify_file_type(path: str | Path) -> str:
+    extension = file_extension(path)
     if extension in CODE_EXTENSIONS:
         return "code"
-    if extension in SPREADSHEET_EXTENSIONS:
+    if extension in {".csv"}:
         return "spreadsheet"
-    if extension in PRESENTATION_EXTENSIONS:
+    if extension in {".pptx"}:
         return "presentation"
-    return "document"
+    if extension in {".pdf", ".docx", ".txt", ".md", ".json"}:
+        return "document"
+    return "binary"
 
 
 def read_text_file(path: Path) -> str:
@@ -73,3 +112,44 @@ def chunk_text(text: str, chunk_size_tokens: int = 650, overlap_tokens: int = 80
             break
         start = max(0, end - overlap_tokens)
     return chunks
+
+
+def now_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def to_iso(ts: float | None) -> str | None:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def safe_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, sec = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {sec}s"
+    return f"{sec}s"
+
+
+def keyword_score(keywords: Iterable[str], text: str) -> float:
+    tokens = {token.lower() for token in keywords if token.strip()}
+    if not tokens:
+        return 0.0
+    lowered = text.lower()
+    hits = sum(1 for token in tokens if token in lowered)
+    return hits / max(1, len(tokens))
+
+
+def top_terms(text: str, limit: int = 5) -> list[str]:
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_+-]{2,}", text.lower())
+    scores: dict[str, int] = {}
+    for word in words:
+        if word in STOP_WORDS:
+            continue
+        scores[word] = scores.get(word, 0) + 1
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [term for term, _ in ranked[:limit]]

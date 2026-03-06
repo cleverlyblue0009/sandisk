@@ -1,153 +1,155 @@
-# Windows Personal Memory Assistant
+# Personal Memory Assistant
 
-Production-grade hackathon project that creates a semantic memory layer over Windows File Explorer.
+Semantic desktop memory layer for Windows.
+Indexes files by meaning and time, tracks app activity, answers natural-language queries, and supports **voice input + voice response**.
 
-## Features
-- Recursive indexing of a selected Windows directory
-- SHA-256 based change detection (skip unchanged files)
-- Real-time monitoring with `watchdog` (`created`, `modified`, `deleted`)
-- Multi-format extraction (`pdf`, `docx`, `pptx`, `txt`, `md`, `csv`, `json`, `py`, `js`, `java`, `cpp`)
-- Chunk-level embeddings (`all-MiniLM-L6-v2`)
-- FAISS vector storage (`IndexFlatL2` via `IndexIDMap2`)
-- SQLite metadata + FAISS ID mapping
-- Natural-language retrieval with Groq query understanding
-- Weighted ranking with transparent score breakdown
-- Groq-generated summary + retrieval explanation per result
-- React + Tailwind dashboard UI
+## Implemented Architecture
+
+1. Python Backend (FastAPI)
+2. Semantic Memory Engine (SentenceTransformers + FAISS)
+3. Activity Tracking Engine (psutil + SQLite) with app categorisation
+4. Voice Engine (faster-whisper STT + pyttsx3 TTS)
+5. Desktop Assistant UI (Electron + React — tabbed, floating bubble)
 
 ## Project Structure
+
 ```text
-backend/
-  main.py
-  config.py
-  database.py
-  hashing.py
-  ingestion.py
-  extractor.py
-  embedding.py
-  retrieval.py
-  ranking.py
-  groq_client.py
-  explanation.py
-  watcher.py
-  utils.py
-  requirements.txt
-  .env.example
-frontend/
-  index.html
-  package.json
-  postcss.config.js
-  tailwind.config.js
-  vite.config.js
-  src/
-    components/
-      DirectorySelector.jsx
-      SearchBar.jsx
-      ResultCard.jsx
-      ScoreBreakdown.jsx
-    pages/
-      Dashboard.jsx
-    services/
-      api.js
-    main.jsx
-    index.css
-README.md
+sandisk/
+  backend/
+    main.py               # FastAPI app — all HTTP endpoints
+    config.py             # Settings from env vars
+    database.py           # SQLite abstraction (files, chunks, activity)
+    ingestion.py          # File scanning, chunking, embedding
+    extractor.py          # PDF / DOCX / PPTX / TXT text extraction
+    embedding.py          # SentenceTransformers + FAISS store
+    semantic_clustering.py# KMeans topic clustering + context inference
+    retrieval.py          # Semantic search pipeline
+    ranking.py            # 0.65 semantic + 0.25 recency + 0.10 keyword
+    timeline.py           # Memory timeline + semantic work sessions
+    activity_tracker.py   # psutil process monitoring every 5 s
+    voice.py              # STT (faster-whisper) + TTS (pyttsx3)
+    watcher.py            # watchdog live file-system events
+    groq_client.py        # Groq LLM query expansion (fallback: heuristic)
+    hashing.py            # SHA-256 change detection
+    utils.py              # Shared helpers
+    requirements.txt
+    data/
+      memory_assistant.db
+      memory_assistant.faiss
+  frontend/
+    electron/
+      main.cjs            # Electron window (always-on-top, bottom-right)
+      preload.cjs         # contextBridge IPC bridge
+    src/
+      App.jsx             # Tabbed floating UI (Search / Timeline / Activity)
+      main.jsx
+      index.css           # Space Grotesk design system
+      services/
+        api.js            # fetch wrappers for all backend endpoints
+    package.json
+    vite.config.js
 ```
 
-## Backend Setup (Windows)
-1. Open PowerShell in project root.
-2. Create and activate virtual environment:
-   ```powershell
-   cd backend
-   py -3.11 -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
-3. Install dependencies:
-   ```powershell
-   pip install -r requirements.txt
-   ```
-4. Configure environment:
-   ```powershell
-   Copy-Item .env.example .env
-   ```
-   Edit `.env` and set `GROQ_API_KEY`.
-5. Run API:
-   ```powershell
-   uvicorn main:app --reload --host 127.0.0.1 --port 8000
-   ```
+## Key Features
 
-## Frontend Setup (Windows)
-1. Open second PowerShell terminal:
-   ```powershell
-   cd frontend
-   npm install
-   npm run dev
-   ```
-2. Open `http://127.0.0.1:5173`.
-
-## How It Works
-1. Select a base directory from dashboard.
-2. Backend performs initial recursive scan.
-3. Each supported file is hashed (`SHA-256`).
-4. If hash unchanged, re-embedding is skipped.
-5. If changed/new:
-   - text is extracted by file type
-   - text is chunked into ~650-token chunks with overlap
-   - chunk embeddings are generated
-   - embeddings are added to FAISS
-   - metadata + FAISS mappings are stored in SQLite
-6. After initial scan, `watchdog` starts monitoring real-time file changes.
-
-## File Type Categories
-- `document`: `.pdf`, `.txt`, `.md`, `.docx`, `.json`
-- `code`: `.py`, `.js`, `.java`, `.cpp`
-- `spreadsheet`: `.csv`
-- `presentation`: `.pptx`
-
-Unsupported files are skipped safely.
-
-## Query Pipeline
-1. Groq analyzes user query:
-   - intent
-   - expanded query
-   - keywords
-   - time hints
-2. Expanded query is embedded.
-3. FAISS returns top chunk matches.
-4. Chunk hits are aggregated per file.
-5. Ranking computes final score.
-6. Groq generates:
-   - 2-sentence summary
-   - 1-sentence explanation
-
-## Ranking Formula
-```text
-Final Score =
-  0.65 * semantic_score
-  + 0.25 * recency_score
-  + 0.10 * keyword_match_score
-```
-
-Where:
-- `semantic_score`: normalized inverse FAISS distance
-- `recency_score`: exponential decay from file modified date
-- `keyword_match_score`: keyword hits in filename/path/type metadata
-
-Every result returns full score breakdown plus weighted components.
+- Automatic recursive indexing of:
+  - `Documents`
+  - `Downloads`
+  - `Desktop`
+  - `Pictures`
+- Supported text extraction:
+  - `.pdf .docx .txt .md .csv .pptx .json .py .js .java`
+- Metadata-only binary handling:
+  - `.exe .dll .iso .zip .rar .mp4 .jpg .png`
+- Chunking for large text:
+  - ~650 token chunks with overlap (inside 500-800 target range)
+- Real-time file updates via `watchdog`:
+  - `file_created`, `file_modified`, `file_deleted`
+- Semantic engine:
+  - `sentence-transformers/all-MiniLM-L6-v2`
+  - FAISS vector retrieval
+  - KMeans semantic clustering
+- Context inference:
+  - `Exam Preparation`, `Coursework`, `Projects`, `General Study Material`
+- Query pipeline:
+  1. Query input
+  2. Groq query expansion
+  3. Embedding generation
+  4. FAISS retrieval
+  5. Ranking with formula:
+     - `0.65 semantic + 0.25 recency + 0.10 keyword`
+- Activity tracker:
+  - Running process tracking every 5 seconds
+  - Start/end and duration persistence in SQLite
+- Memory timeline:
+  - Combines file events + process activity + semantic cluster metadata
+- Semantic recall sessions:
+  - Auto groups related file activity into sessions by topic/time window
+- Floating assistant:
+  - Bubble-style Electron window that expands to chat
+- Windows start on boot:
+  - Electron `app.setLoginItemSettings({ openAtLogin: true })`
 
 ## API Endpoints
-- `GET /health`
-- `POST /api/directory/select`
-- `GET /api/index/status`
-- `GET /api/files`
-- `POST /api/search`
 
-## Example Test Queries
-- `Could you retrieve the stuff I used for OS exam?`
-- `Find my networking lab code from last month`
-- `Show presentation slides about distributed systems`
-- `What notes did I keep for machine learning revision?`
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/query` | Semantic document search |
+| `GET`  | `/timeline` | Memory timeline (file events + process sessions) |
+| `GET`  | `/activity/stats` | Per-process usage with category labels |
+| `GET`  | `/index/status` | Indexing progress + FAISS counts |
+| `POST` | `/index/start` | Trigger directory scan |
+| `GET`  | `/health` | Health check |
+| `GET`  | `/voice/status` | STT/TTS availability |
+| `POST` | `/voice/transcribe` | Whisper STT — upload audio → text |
+| `POST` | `/voice/speak` | pyttsx3 TTS — text → system speakers |
 
-## Notes
-- This implementation is Windows-first and normalizes paths for Windows behavior.
-- If `GROQ_API_KEY` is missing, deterministic fallbacks keep the app operational, but Groq output quality is reduced.
+### Voice Input (UI)
+The frontend uses the **browser Web Speech API** (Chrome/Edge) for zero-latency voice input.
+The `/voice/transcribe` endpoint provides an offline fallback using faster-whisper.
+
+### Voice Response
+The frontend uses **browser SpeechSynthesis** (toggle 🔊/🔇 in the header).
+The `/voice/speak` endpoint pipes text through pyttsx3 on the host OS.
+
+## Run Backend (Windows)
+
+```powershell
+cd backend
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Set `GROQ_API_KEY` in `backend/.env` for LLM query expansion.  
+If missing, deterministic fallback query expansion is used.
+
+## Run Desktop Assistant (Windows)
+
+```powershell
+cd frontend
+npm install
+npm run dev:desktop
+```
+
+For production UI bundle:
+
+```powershell
+npm run build
+npm start
+```
+
+## Example Queries
+
+Text or voice — the UI auto-routes each query to the correct pipeline.
+
+| Query | Routed to |
+|-------|-----------|
+| "What documents did I use for OS exam?" | Document search |
+| "What software engineering materials do I have?" | Document search |
+| "What did I play last month?" | Activity stats |
+| "Show my gaming time this week" | Activity stats |
+| "What did I work on yesterday?" | Timeline |
+| "Show my recent timeline" | Timeline |
+| "What projects did I work on recently?" | Document search |

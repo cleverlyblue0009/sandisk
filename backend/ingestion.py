@@ -1,29 +1,43 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
+
+import numpy as np
 
 from config import Settings
 from database import Database
 from embedding import EmbeddingEngine, FaissStore
 from extractor import TextExtractor
 from hashing import compute_sha256
-from utils import categorize_file, chunk_text, count_tokens, is_supported_file, normalize_windows_path
+from summarizer import extract_topics, summarize
+from utils import (
+    chunk_text,
+    classify_file_type,
+    count_tokens,
+    file_extension,
+    is_binary_metadata_only,
+    is_supported_text_file,
+    normalize_windows_path,
+)
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ScanStats:
-    total_supported_files: int = 0
-    scanned_files: int = 0
-    indexed_files: int = 0
-    updated_files: int = 0
-    skipped_files: int = 0
-    failed_files: int = 0
+    total_files_seen: int = 0
+    text_indexed: int = 0
+    text_updated: int = 0
+    text_unchanged: int = 0
+    binary_metadata: int = 0
+    unsupported: int = 0
+    deleted: int = 0
+    failed: int = 0
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -32,6 +46,7 @@ class ScanStats:
 class IngestionService:
     def __init__(
         self,
+        *,
         settings: Settings,
         database: Database,
         extractor: TextExtractor,
@@ -45,169 +60,211 @@ class IngestionService:
         self.faiss_store = faiss_store
         self._lock = threading.RLock()
 
-    def _is_temp_or_locked_file(self, path: Path) -> bool:
-        """Check if file is temporary or locked (Office temp files, etc)"""
-        name = path.name.lower()
-        # Skip Office temporary files (~$), system files (.), and common temp patterns
-        return (
-            name.startswith("~$")
-            or name.startswith(".")
-            or name.startswith("~")
-            or name.endswith(".tmp")
-            or name.endswith(".temp")
-        )
-
-    def _is_file_too_large(self, path: Path, max_size_mb: int = 500) -> bool:
-        """Check if file exceeds memory-safe size limit"""
-        try:
-            size_mb = path.stat().st_size / (1024 * 1024)
-            return size_mb > max_size_mb
-        except (OSError, ValueError):
-            return True
-
-    def scan_directory(
+    def scan_directories(
         self,
-        base_directory: str,
+        roots: Iterable[Path],
         progress_callback: Callable[[dict[str, int]], None] | None = None,
     ) -> dict[str, int]:
-        base_path = Path(base_directory).expanduser().resolve()
-        files = [
-            path
-            for path in base_path.rglob("*")
-            if path.is_file() and is_supported_file(path)
-        ]
-        stats = ScanStats(total_supported_files=len(files))
-
-        for file_path in files:
-            try:
-                # Skip temporary/locked files before processing
-                if self._is_temp_or_locked_file(file_path):
-                    stats.skipped_files += 1
-                    logger.debug("Skipping temporary file: %s", file_path)
+        stats = ScanStats()
+        for root in roots:
+            if not root.exists() or not root.is_dir():
+                continue
+            for candidate in root.rglob("*"):
+                if not candidate.is_file():
+                    continue
+                stats.total_files_seen += 1
+                try:
+                    result = self.process_file(candidate, source="scan", event_type="file_modified")
+                    if result == "indexed":
+                        stats.text_indexed += 1
+                    elif result == "updated":
+                        stats.text_updated += 1
+                    elif result == "unchanged":
+                        stats.text_unchanged += 1
+                    elif result == "binary_metadata":
+                        stats.binary_metadata += 1
+                    elif result == "unsupported":
+                        stats.unsupported += 1
+                except Exception:
+                    logger.exception("Failed to index %s", candidate)
+                    stats.failed += 1
+                finally:
                     if progress_callback:
                         progress_callback(stats.to_dict())
-                    continue
-
-                # Skip extremely large files to prevent memory issues
-                if self._is_file_too_large(file_path):
-                    stats.skipped_files += 1
-                    logger.warning("Skipping oversized file (>500MB): %s", file_path)
-                    if progress_callback:
-                        progress_callback(stats.to_dict())
-                    continue
-
-                result = self.process_file(file_path)
-                stats.scanned_files += 1
-                if result == "indexed":
-                    stats.indexed_files += 1
-                elif result == "updated":
-                    stats.updated_files += 1
-                elif result == "skipped":
-                    stats.skipped_files += 1
-            except MemoryError:
-                stats.failed_files += 1
-                logger.error("MemoryError processing file (too large): %s", file_path)
-            except Exception:
-                stats.failed_files += 1
-                logger.exception("Failed to ingest file: %s", file_path)
-            finally:
-                if progress_callback:
-                    progress_callback(stats.to_dict())
-
         return stats.to_dict()
 
-    def process_file(self, file_path: str | Path) -> str:
+    def process_file(
+        self,
+        file_path: str | Path,
+        *,
+        source: str,
+        event_type: str,
+    ) -> str:
         with self._lock:
             path = Path(file_path).expanduser().resolve()
             if not path.exists() or not path.is_file():
-                return "skipped"
-            if not is_supported_file(path):
-                return "skipped"
-
-            # Double-check for temp files
-            if self._is_temp_or_locked_file(path):
-                return "skipped"
+                return "unsupported"
 
             normalized_path = normalize_windows_path(path)
-            extension = path.suffix.lower()
-            category = categorize_file(path)
-            
-            try:
-                file_hash = compute_sha256(path)
-            except MemoryError:
-                logger.error("MemoryError computing hash for: %s", path)
-                raise
-            
-            file_size = int(path.stat().st_size)
-            modified_time = float(path.stat().st_mtime)
+            file_name = path.name
+            extension = file_extension(path)
+            file_type = classify_file_type(path)
+            stat = path.stat()
+            size_bytes = int(stat.st_size)
+            modified_time = float(stat.st_mtime)
+            created_time = float(stat.st_ctime)
             existing = self.database.get_file_by_path(normalized_path)
 
-            if existing and existing["sha256"] == file_hash:
-                self.database.touch_file(int(existing["id"]), size_bytes=file_size, modified_time=modified_time)
-                return "skipped"
+            if is_binary_metadata_only(path):
+                # Binary/media archives are tracked as metadata only and never opened.
+                file_id, _ = self.database.upsert_file(
+                    file_path=normalized_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    extension=extension,
+                    size_bytes=size_bytes,
+                    modified_time=modified_time,
+                    created_time=created_time,
+                    sha256=None,
+                    is_binary=True,
+                )
+                if existing and int(existing.get("is_binary", 0)) == 0:
+                    removed = self.database.clear_chunks_for_file(file_id)
+                    self.faiss_store.remove(removed)
+                self.database.record_file_event(
+                    file_path=normalized_path,
+                    file_name=file_name,
+                    event_type=event_type,
+                    source=source,
+                    details="metadata-only",
+                )
+                return "binary_metadata"
 
-            try:
-                extracted_text = self.extractor.extract_text(path)
-            except MemoryError:
-                logger.error("MemoryError extracting text from: %s", path)
-                raise
-            
-            if not extracted_text.strip():
-                extracted_text = path.name
+            if not is_supported_text_file(path):
+                return "unsupported"
 
+            if size_bytes > self.settings.max_file_size_mb * 1024 * 1024:
+                self.database.record_file_event(
+                    file_path=normalized_path,
+                    file_name=file_name,
+                    event_type=event_type,
+                    source=source,
+                    details="skipped-size-limit",
+                )
+                return "unsupported"
+
+            file_hash = compute_sha256(path)
+            if existing and str(existing.get("sha256", "")) == file_hash:
+                self.database.upsert_file(
+                    file_path=normalized_path,
+                    file_name=file_name,
+                    file_type=file_type,
+                    extension=extension,
+                    size_bytes=size_bytes,
+                    modified_time=modified_time,
+                    created_time=created_time,
+                    sha256=file_hash,
+                    is_binary=False,
+                )
+                self.database.record_file_event(
+                    file_path=normalized_path,
+                    file_name=file_name,
+                    event_type=event_type,
+                    source=source,
+                    details="unchanged",
+                )
+                return "unchanged"
+
+            raw_text = self.extractor.extract_text(path).strip()
+            if not raw_text:
+                raw_text = f"{file_name}\n{normalized_path}"
+
+            # Keep chunks in the requested 500-800 token range via settings defaults.
             chunks = chunk_text(
-                extracted_text,
+                raw_text,
                 chunk_size_tokens=self.settings.chunk_size_tokens,
                 overlap_tokens=self.settings.chunk_overlap_tokens,
             )
             if not chunks:
-                chunks = [path.name]
+                chunks = [raw_text]
 
-            try:
-                vectors = self.embedding_engine.encode_texts(chunks)
-            except MemoryError:
-                logger.error("MemoryError encoding embeddings for: %s", path)
-                raise
-            
+            vectors = self.embedding_engine.encode_texts(chunks)
             if vectors.shape[0] != len(chunks):
                 raise RuntimeError("Embedding count mismatch")
 
-            if existing:
-                file_id = int(existing["id"])
-                removed_faiss_ids = self.database.clear_chunks_for_file(file_id)
-                self.faiss_store.remove(removed_faiss_ids)
-                self.database.update_file(
-                    file_id=file_id,
-                    filename=path.name,
-                    extension=extension,
-                    category=category,
-                    sha256=file_hash,
-                    size_bytes=file_size,
-                    modified_time=modified_time,
-                )
-                status = "updated"
-            else:
-                file_id = self.database.insert_file(
-                    path=normalized_path,
-                    filename=path.name,
-                    extension=extension,
-                    category=category,
-                    sha256=file_hash,
-                    size_bytes=file_size,
-                    modified_time=modified_time,
-                )
-                status = "indexed"
+            file_id, created = self.database.upsert_file(
+                file_path=normalized_path,
+                file_name=file_name,
+                file_type=file_type,
+                extension=extension,
+                size_bytes=size_bytes,
+                modified_time=modified_time,
+                created_time=created_time,
+                sha256=file_hash,
+                is_binary=False,
+            )
+            removed = self.database.clear_chunks_for_file(file_id)
+            self.faiss_store.remove(removed)
 
-            chunk_rows = [(idx, chunk, count_tokens(chunk)) for idx, chunk in enumerate(chunks)]
+            chunk_rows: list[tuple[int, str, str, str, str, int, bytes, float]] = []
+            for index, chunk in enumerate(chunks):
+                embedding_blob = np.asarray(vectors[index], dtype=np.float32).tobytes()
+                chunk_rows.append(
+                    (
+                        index,
+                        normalized_path,
+                        file_name,
+                        file_type,
+                        chunk,
+                        count_tokens(chunk),
+                        embedding_blob,
+                        modified_time,
+                    )
+                )
             chunk_ids = self.database.insert_chunks(file_id=file_id, chunks=chunk_rows)
+
+            # Use chunk IDs as FAISS vector IDs for direct metadata joins.
             self.faiss_store.add(vectors=vectors, ids=chunk_ids)
             mappings = [(chunk_id, file_id, chunk_id) for chunk_id in chunk_ids]
             self.database.insert_faiss_mappings(mappings)
-            return status
 
-    def delete_file(self, file_path: str | Path) -> bool:
+            # Precompute summaries/topics at index time so search responses stay fast.
+            summary_text = summarize(" ".join(chunks[:4]), max_sentences=3, max_chars=320)
+            topics = extract_topics(" ".join(chunks[:4]), limit=6)
+            self.database.upsert_file(
+                file_path=normalized_path,
+                file_name=file_name,
+                file_type=file_type,
+                extension=extension,
+                size_bytes=size_bytes,
+                modified_time=modified_time,
+                created_time=created_time,
+                sha256=file_hash,
+                is_binary=False,
+                summary=summary_text,
+                topics_json=json.dumps(topics, ensure_ascii=False),
+            )
+
+            self.database.record_file_event(
+                file_path=normalized_path,
+                file_name=file_name,
+                event_type="file_created" if created else event_type,
+                source=source,
+                details="reindexed",
+            )
+            return "indexed" if created else "updated"
+
+    def delete_file(self, file_path: str | Path, *, source: str = "watchdog") -> bool:
         with self._lock:
             normalized_path = normalize_windows_path(file_path)
-            faiss_ids = self.database.delete_file_by_path(normalized_path)
-            self.faiss_store.remove(faiss_ids)
-            return bool(faiss_ids)
+            removed_ids, file_name = self.database.delete_file_by_path(normalized_path)
+            if removed_ids:
+                self.faiss_store.remove(removed_ids)
+            self.database.record_file_event(
+                file_path=normalized_path,
+                file_name=file_name or Path(normalized_path).name,
+                event_type="file_deleted",
+                source=source,
+                details=None,
+            )
+            return bool(removed_ids)

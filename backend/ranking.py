@@ -4,33 +4,32 @@ import math
 import time
 from typing import Any
 
+from utils import keyword_score
+
+SEMANTIC_WEIGHT = 0.65
+RECENCY_WEIGHT = 0.25
+KEYWORD_WEIGHT = 0.10
+
 
 def semantic_scores_from_distances(best_distances: dict[int, float]) -> dict[int, float]:
     if not best_distances:
         return {}
-    inverse_scores = {file_id: 1.0 / (1.0 + max(distance, 0.0)) for file_id, distance in best_distances.items()}
+    inverse_scores = {
+        file_id: 1.0 / (1.0 + max(0.0, float(distance)))
+        for file_id, distance in best_distances.items()
+    }
     max_inverse = max(inverse_scores.values()) or 1.0
-    return {file_id: value / max_inverse for file_id, value in inverse_scores.items()}
+    return {file_id: score / max_inverse for file_id, score in inverse_scores.items()}
 
 
-def recency_score(modified_time: float, now: float | None = None, half_life_days: float = 30.0) -> float:
+def recency_score(modified_time: float, now: float | None = None, half_life_days: float = 21.0) -> float:
     now = now or time.time()
-    seconds_old = max(0.0, now - modified_time)
-    days_old = seconds_old / 86400.0
+    age_seconds = max(0.0, now - float(modified_time))
+    age_days = age_seconds / 86400.0
     if half_life_days <= 0:
         return 0.0
     decay = math.log(2) / half_life_days
-    return math.exp(-decay * days_old)
-
-
-def keyword_match_score(keywords: list[str], text_fields: list[str]) -> float:
-    cleaned_keywords = [keyword.strip().lower() for keyword in keywords if keyword.strip()]
-    if not cleaned_keywords:
-        return 0.0
-
-    searchable = " ".join(text_fields).lower()
-    matched = sum(1 for keyword in set(cleaned_keywords) if keyword in searchable)
-    return matched / max(1, len(set(cleaned_keywords)))
+    return math.exp(-decay * age_days)
 
 
 def rank_file_candidates(candidates: dict[int, dict[str, Any]], keywords: list[str]) -> list[dict[str, Any]]:
@@ -38,41 +37,44 @@ def rank_file_candidates(candidates: dict[int, dict[str, Any]], keywords: list[s
         return []
 
     best_distances = {
-        file_id: min(float(distance) for distance in candidate["distances"])
-        for file_id, candidate in candidates.items()
+        file_id: min(float(distance) for distance in payload["distances"])
+        for file_id, payload in candidates.items()
     }
-    semantic_scores = semantic_scores_from_distances(best_distances)
+    semantic_lookup = semantic_scores_from_distances(best_distances)
+    now = time.time()
 
     ranked: list[dict[str, Any]] = []
-    now = time.time()
-    for file_id, candidate in candidates.items():
-        metadata = candidate["metadata"]
-        semantic = semantic_scores.get(file_id, 0.0)
-        recency = recency_score(float(metadata["modified_time"]), now=now)
-        keyword = keyword_match_score(
+    for file_id, payload in candidates.items():
+        meta = payload["metadata"]
+        semantic = semantic_lookup.get(file_id, 0.0)
+        recency = recency_score(float(meta["modified_time"]), now=now)
+        keyword = keyword_score(
             keywords,
-            [
-                str(metadata.get("filename", "")),
-                str(metadata.get("path", "")),
-                str(metadata.get("category", "")),
-                str(metadata.get("extension", "")),
-            ],
+            " ".join(
+                [
+                    str(meta.get("file_name", "")),
+                    str(meta.get("file_path", "")),
+                    str(meta.get("file_type", "")),
+                    str(meta.get("cluster_label", "")),
+                    str(meta.get("context_label", "")),
+                ]
+            ),
         )
 
-        semantic_component = 0.65 * semantic
-        recency_component = 0.25 * recency
-        keyword_component = 0.10 * keyword
+        semantic_component = SEMANTIC_WEIGHT * semantic
+        recency_component = RECENCY_WEIGHT * recency
+        keyword_component = KEYWORD_WEIGHT * keyword
         final_score = semantic_component + recency_component + keyword_component
 
         ranked.append(
             {
                 "file_id": file_id,
-                "metadata": metadata,
-                "top_chunks": candidate["chunks"],
+                "metadata": meta,
+                "top_chunks": payload["chunks"],
                 "distance_stats": {
-                    "best_distance": min(candidate["distances"]),
-                    "mean_distance": sum(candidate["distances"]) / len(candidate["distances"]),
-                    "hit_count": len(candidate["distances"]),
+                    "best_distance": min(payload["distances"]),
+                    "mean_distance": sum(payload["distances"]) / len(payload["distances"]),
+                    "hit_count": len(payload["distances"]),
                 },
                 "score_breakdown": {
                     "semantic_score": round(semantic, 4),
@@ -84,7 +86,7 @@ def rank_file_candidates(candidates: dict[int, dict[str, Any]], keywords: list[s
                     "final_score": round(final_score, 4),
                     "formula": "0.65*semantic + 0.25*recency + 0.10*keyword",
                 },
-                "final_score": final_score,
+                "final_score": float(final_score),
             }
         )
 
